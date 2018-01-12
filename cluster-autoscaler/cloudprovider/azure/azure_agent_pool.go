@@ -114,6 +114,14 @@ func (as *AgentPool) preprocessParameters() {
 	if as.config.WindowsAdminPassword != "" {
 		as.parameters["windowsAdminPassword"] = map[string]string{"value": as.config.WindowsAdminPassword}
 	}
+
+	// etcd TLS parameters (only for acs-engine > v0.11.0)
+	if as.config.EtcdClientPrivateKey != "" {
+		as.parameters["etcdClientPrivateKey"] = map[string]string{"value": as.config.EtcdClientPrivateKey}
+	}
+	if as.config.EtcdServerPrivateKey != "" {
+		as.parameters["etcdServerPrivateKey"] = map[string]string{"value": as.config.EtcdServerPrivateKey}
+	}
 }
 
 // MinSize returns minimum size of the node group.
