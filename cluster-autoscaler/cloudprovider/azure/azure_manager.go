@@ -23,7 +23,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/arm/compute"
@@ -37,13 +36,16 @@ import (
 	"github.com/golang/glog"
 
 	"gopkg.in/gcfg.v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 )
 
 const (
 	vmTypeVMSS     = "vmss"
 	vmTypeStandard = "standard"
+
+	scaleToZeroSupported = false
+	refreshInterval      = 1 * time.Minute
 )
 
 // VirtualMachineScaleSetsClient defines needed functions for azure compute.VirtualMachineScaleSetsClient.
@@ -51,6 +53,8 @@ type VirtualMachineScaleSetsClient interface {
 	Get(resourceGroupName string, vmScaleSetName string) (result compute.VirtualMachineScaleSet, err error)
 	CreateOrUpdate(resourceGroupName string, name string, parameters compute.VirtualMachineScaleSet, cancel <-chan struct{}) (<-chan compute.VirtualMachineScaleSet, <-chan error)
 	DeleteInstances(resourceGroupName string, vmScaleSetName string, vmInstanceIDs compute.VirtualMachineScaleSetVMInstanceRequiredIDs, cancel <-chan struct{}) (<-chan compute.OperationStatusResponse, <-chan error)
+	List(resourceGroupName string) (result compute.VirtualMachineScaleSetListResult, err error)
+	ListNextResults(lastResults compute.VirtualMachineScaleSetListResult) (result compute.VirtualMachineScaleSetListResult, err error)
 }
 
 // VirtualMachineScaleSetVMsClient defines needed functions for azure compute.VirtualMachineScaleSetVMsClient.
@@ -102,14 +106,10 @@ type AzureManager struct {
 	disksClient                     DisksClient
 	storageAccountsClient           AccountsClient
 
-	nodeGroups []cloudprovider.NodeGroup
-	// cache of mapping from instance name to nodeGroup.
-	nodeGroupsCache map[AzureRef]cloudprovider.NodeGroup
-	// cache of mapping from instance name to instanceID.
-	instanceIDsCache map[string]string
-
-	cacheMutex sync.Mutex
-	interrupt  chan struct{}
+	asgCache              *asgCache
+	lastRefresh           time.Time
+	asgAutoDiscoverySpecs []cloudprovider.LabelAutoDiscoveryConfig
+	explicitlyConfigured  map[azureRef]bool
 }
 
 // Config holds the configuration parsed from the --cloud-config flag
@@ -159,7 +159,7 @@ func (c *Config) TrimSpace() {
 }
 
 // CreateAzureManager creates Azure Manager object to work with Azure.
-func CreateAzureManager(configReader io.Reader) (*AzureManager, error) {
+func CreateAzureManager(configReader io.Reader, discoveryOpts cloudprovider.NodeGroupDiscoveryOptions) (*AzureManager, error) {
 	var err error
 	var cfg Config
 
@@ -312,20 +312,28 @@ func CreateAzureManager(configReader io.Reader) (*AzureManager, error) {
 		deploymentsClient:               deploymentsClient,
 		virtualMachinesClient:           virtualMachinesClient,
 		storageAccountsClient:           storageAccountsClient,
-
-		interrupt:        make(chan struct{}),
-		instanceIDsCache: make(map[string]string),
-		nodeGroups:       make([]cloudprovider.NodeGroup, 0),
-		nodeGroupsCache:  make(map[AzureRef]cloudprovider.NodeGroup),
+		explicitlyConfigured:            make(map[azureRef]bool),
 	}
 
-	go wait.Until(func() {
-		manager.cacheMutex.Lock()
-		defer manager.cacheMutex.Unlock()
-		if err := manager.regenerateCache(); err != nil {
-			glog.Errorf("Error while regenerating AS cache: %v", err)
-		}
-	}, 5*time.Minute, manager.interrupt)
+	cache, err := newAsgCache(manager)
+	if err != nil {
+		return nil, err
+	}
+	manager.asgCache = cache
+
+	specs, err := discoveryOpts.ParseLabelAutoDiscoverySpecs()
+	if err != nil {
+		return nil, err
+	}
+	manager.asgAutoDiscoverySpecs = specs
+
+	if err := manager.fetchExplicitAsgs(discoveryOpts.NodeGroupSpecs); err != nil {
+		return nil, err
+	}
+
+	if err := manager.forceRefresh(); err != nil {
+		return nil, err
+	}
 
 	return manager, nil
 }
@@ -379,186 +387,226 @@ func NewServicePrincipalTokenFromCredentials(config *Config, env *azure.Environm
 	return nil, fmt.Errorf("No credentials provided for AAD application %s", config.AADClientID)
 }
 
-// RegisterNodeGroup registers node group in Azure Manager.
-func (m *AzureManager) RegisterNodeGroup(nodeGroup cloudprovider.NodeGroup) {
-	m.cacheMutex.Lock()
-	defer m.cacheMutex.Unlock()
+func (m *AzureManager) fetchExplicitAsgs(specs []string) error {
+	changed := false
+	for _, spec := range specs {
+		asg, err := m.buildAsgFromSpec(spec)
+		if err != nil {
+			return fmt.Errorf("failed to parse node group spec: %v", err)
+		}
+		if m.RegisterAsg(asg) {
+			changed = true
+		}
+		m.explicitlyConfigured[asg.getAzureRef()] = true
+	}
 
-	m.nodeGroups = append(m.nodeGroups, nodeGroup)
+	if changed {
+		if err := m.regenerateCache(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (m *AzureManager) nodeGroupRegisted(nodeGroup string) bool {
-	for _, ng := range m.nodeGroups {
-		if nodeGroup == ng.Id() {
-			return true
+func (m *AzureManager) buildAsgFromSpec(spec string) (Asg, error) {
+	s, err := dynamic.SpecFromString(spec, scaleToZeroSupported)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse node group spec: %v", err)
+	}
+
+	switch m.config.VMType {
+	case vmTypeStandard:
+		return NewAgentPool(s, m)
+	case vmTypeVMSS:
+		return NewScaleSet(s, m)
+	default:
+		return nil, fmt.Errorf("vmtype %s not supported", m.config.VMType)
+	}
+}
+
+// Refresh is called before every main loop and can be used to dynamically update cloud provider state.
+// In particular the list of node groups returned by NodeGroups can change as a result of CloudProvider.Refresh().
+func (m *AzureManager) Refresh() error {
+	if m.lastRefresh.Add(refreshInterval).After(time.Now()) {
+		return nil
+	}
+	return m.forceRefresh()
+}
+
+func (m *AzureManager) forceRefresh() error {
+	if err := m.fetchAutoAsgs(); err != nil {
+		glog.Errorf("Failed to fetch ASGs: %v", err)
+		return err
+	}
+	m.lastRefresh = time.Now()
+	glog.V(2).Infof("Refreshed ASG list, next refresh after %v", m.lastRefresh.Add(refreshInterval))
+	return nil
+}
+
+// Fetch automatically discovered ASGs. These ASGs should be unregistered if
+// they no longer exist in Azure.
+func (m *AzureManager) fetchAutoAsgs() error {
+	groups, err := m.getFilteredAutoscalingGroups(m.asgAutoDiscoverySpecs)
+	if err != nil {
+		return fmt.Errorf("cannot autodiscover ASGs: %s", err)
+	}
+
+	changed := false
+	exists := make(map[azureRef]bool)
+	for _, asg := range groups {
+		azRef := asg.getAzureRef()
+		exists[azRef] = true
+		if m.explicitlyConfigured[azRef] {
+			// This ASG was explicitly configured, but would also be
+			// autodiscovered. We want the explicitly configured min and max
+			// nodes to take precedence.
+			glog.V(3).Infof("Ignoring explicitly configured ASG %s for autodiscovery.", asg.Id())
+			continue
+		}
+		if m.RegisterAsg(asg) {
+			glog.V(3).Infof("Autodiscovered ASG %s using tags %v", asg.Id(), m.asgAutoDiscoverySpecs)
+			changed = true
 		}
 	}
 
-	return false
+	for _, asg := range m.getAsgs() {
+		azRef := asg.getAzureRef()
+		if !exists[azRef] && !m.explicitlyConfigured[azRef] {
+			m.UnregisterAsg(asg)
+			changed = true
+		}
+	}
+
+	if changed {
+		if err := m.regenerateCache(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-// GetNodeGroupForInstance returns nodeGroup of the given Instance
-func (m *AzureManager) GetNodeGroupForInstance(instance *AzureRef) (cloudprovider.NodeGroup, error) {
-	glog.V(5).Infof("Looking for node group for instance: %q", instance)
-
-	glog.V(8).Infof("Cache BEFORE: %v\n", m.nodeGroupsCache)
-
-	m.cacheMutex.Lock()
-	defer m.cacheMutex.Unlock()
-	if nodeGroup, found := m.nodeGroupsCache[*instance]; found {
-		return nodeGroup, nil
-	}
-
-	if err := m.regenerateCache(); err != nil {
-		return nil, fmt.Errorf("Error while looking for nodeGroup for instance %+v, error: %v", *instance, err)
-	}
-
-	glog.V(8).Infof("Cache AFTER: %v\n", m.nodeGroupsCache)
-
-	if nodeGroup, found := m.nodeGroupsCache[*instance]; found {
-		return nodeGroup, nil
-	}
-
-	// instance does not belong to any configured nodeGroup.
-	return nil, nil
+func (m *AzureManager) getAsgs() []Asg {
+	return m.asgCache.get()
 }
 
-// GetInstanceIDs gets instanceIDs for specified instances.
-func (m *AzureManager) GetInstanceIDs(instances []*AzureRef) []string {
-	m.cacheMutex.Lock()
-	defer m.cacheMutex.Unlock()
-
-	instanceIds := make([]string, len(instances))
-	for i, instance := range instances {
-		instanceIds[i] = m.instanceIDsCache[instance.Name]
-	}
-
-	return instanceIds
+func (m *AzureManager) getInstanceIDs(instances []*azureRef) []string {
+	return m.asgCache.getInstanceIDs(instances)
 }
 
-func (m *AzureManager) regenerateCache() (err error) {
-	var newCache map[AzureRef]cloudprovider.NodeGroup
-	var newInstanceIDsCache map[string]string
+// RegisterAsg registers an ASG.
+func (m *AzureManager) RegisterAsg(asg Asg) bool {
+	return m.asgCache.Register(asg)
+}
 
+// UnregisterAsg unregisters an ASG.
+func (m *AzureManager) UnregisterAsg(asg Asg) bool {
+	return m.asgCache.Unregister(asg)
+}
+
+// GetAsgForInstance returns AsgConfig of the given Instance
+func (m *AzureManager) GetAsgForInstance(instance *azureRef) (Asg, error) {
+	return m.asgCache.FindForInstance(instance)
+}
+
+func (m *AzureManager) regenerateCache() error {
+	m.asgCache.mutex.Lock()
+	defer m.asgCache.mutex.Unlock()
+	return m.asgCache.regenerate()
+}
+
+// Cleanup the ASG cache.
+func (m *AzureManager) Cleanup() {
+	m.asgCache.Cleanup()
+}
+
+func (m *AzureManager) getFilteredAutoscalingGroups(filter []cloudprovider.LabelAutoDiscoveryConfig) (asgs []Asg, err error) {
 	switch m.config.VMType {
 	case vmTypeVMSS:
-		newCache, newInstanceIDsCache, err = m.listScaleSets()
+		asgs, err = m.listScaleSets(filter)
 	case vmTypeStandard:
-		newCache, newInstanceIDsCache, err = m.listAgentPools()
+		asgs, err = m.listAgentPools(filter)
 	default:
 		err = fmt.Errorf("vmType %q not supported", m.config.VMType)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	m.nodeGroupsCache = newCache
-	m.instanceIDsCache = newInstanceIDsCache
-	return nil
-}
-
-func (m *AzureManager) getNodeGroupByID(id string) cloudprovider.NodeGroup {
-	for _, ng := range m.nodeGroups {
-		if id == ng.Id() {
-			return ng
-		}
-	}
-
-	return nil
-}
-
-func (m *AzureManager) listAgentPools() (map[AzureRef]cloudprovider.NodeGroup, map[string]string, error) {
-	as := make(map[AzureRef]cloudprovider.NodeGroup)
-	instanceIDs := make(map[string]string)
-
-	for _, nodeGroup := range m.nodeGroups {
-		agentPool, ok := nodeGroup.(*AgentPool)
-		if !ok {
-			return nil, nil, fmt.Errorf("node group %q is not AgentPool", nodeGroup)
-		}
-
-		_, vmIndex, err := agentPool.GetVMIndexes()
-		if err != nil {
-			glog.Errorf("GetVMIndexes for node group %q failed: %v", nodeGroup.Id(), err)
-			return nil, nil, err
-		}
-
-		for idx := range vmIndex {
-			id := vmIndex[idx].ID
-			vmID := vmIndex[idx].VMID
-
-			idRef := AzureRef{
-				Name: id,
-			}
-			vmIDRef := AzureRef{
-				Name: vmID,
-			}
-			as[idRef] = nodeGroup
-			as[vmIDRef] = nodeGroup
-			instanceIDs[id] = fmt.Sprintf("%d", idx)
-			instanceIDs[vmID] = fmt.Sprintf("%d", idx)
-		}
-	}
-
-	return as, instanceIDs, nil
+	return asgs, nil
 }
 
 // listScaleSets gets a list of scale sets and instanceIDs.
-func (m *AzureManager) listScaleSets() (map[AzureRef]cloudprovider.NodeGroup, map[string]string, error) {
-	var err error
-	scaleSets := make(map[AzureRef]cloudprovider.NodeGroup)
-	instanceIDs := make(map[string]string)
-
-	for _, sset := range m.nodeGroups {
-		glog.V(4).Infof("Listing Scale Set information for %s", sset.Id())
-
-		resourceGroup := m.config.ResourceGroup
-		ssInfo, err := m.virtualMachineScaleSetsClient.Get(resourceGroup, sset.Id())
-		if err != nil {
-			glog.Errorf("Failed to get scaleSet with name %s: %v", sset.Id(), err)
-			return nil, nil, err
-		}
-
-		result, err := m.virtualMachineScaleSetVMsClient.List(resourceGroup, *ssInfo.Name, "", "", "")
-		if err != nil {
-			glog.Errorf("Failed to list vm for scaleSet %s: %v", *ssInfo.Name, err)
-			return nil, nil, err
-		}
-
-		moreResult := (result.Value != nil && len(*result.Value) > 0)
-		for moreResult {
-			for _, instance := range *result.Value {
-				// Convert to lower because instance.ID is in different in different API calls (e.g. GET and LIST).
-				name := "azure://" + strings.ToLower(*instance.ID)
-				vmID := "azure://" + strings.ToLower(*instance.VMID)
-				ref := AzureRef{
-					Name: name,
-				}
-				vmIDRef := AzureRef{
-					Name: vmID,
-				}
-				scaleSets[ref] = sset
-				scaleSets[vmIDRef] = sset
-				instanceIDs[name] = *instance.InstanceID
-			}
-
-			moreResult = false
-			if result.NextLink != nil {
-				result, err = m.virtualMachineScaleSetVMsClient.ListNextResults(result)
-				if err != nil {
-					glog.Errorf("virtualMachineScaleSetVMsClient.ListNextResults failed: %v", err)
-					return nil, nil, err
-				}
-
-				moreResult = (result.Value != nil && len(*result.Value) > 0)
-			}
-		}
+func (m *AzureManager) listScaleSets(filter []cloudprovider.LabelAutoDiscoveryConfig) (asgs []Asg, err error) {
+	result, err := m.virtualMachineScaleSetsClient.List(m.config.ResourceGroup)
+	if err != nil {
+		glog.Errorf("VirtualMachineScaleSetsClient.List for %v failed: %v", m.config.ResourceGroup, err)
+		return nil, err
 	}
 
-	return scaleSets, instanceIDs, err
+	moreResults := (result.Value != nil && len(*result.Value) > 0)
+	for moreResults {
+		for _, scaleSet := range *result.Value {
+			if len(filter) > 0 {
+				if scaleSet.Tags == nil || len(*scaleSet.Tags) == 0 {
+					continue
+				}
+
+				if !matchDiscoveryConfig(*scaleSet.Tags, filter) {
+					continue
+				}
+			}
+
+			spec := &dynamic.NodeGroupSpec{
+				Name:               *scaleSet.Name,
+				MinSize:            1,
+				MaxSize:            -1,
+				SupportScaleToZero: scaleToZeroSupported,
+			}
+			asg, _ := NewScaleSet(spec, m)
+			asgs = append(asgs, asg)
+		}
+		moreResults = false
+
+		if result.NextLink != nil {
+			result, err = m.virtualMachineScaleSetsClient.ListNextResults(result)
+			if err != nil {
+				glog.Errorf("VirtualMachineScaleSetsClient.ListNextResults for %v failed: %v", m.config.ResourceGroup, err)
+				return nil, err
+			}
+
+			moreResults = (result.Value != nil && len(*result.Value) > 0)
+		}
+
+	}
+
+	return asgs, nil
 }
 
-// Cleanup closes the channel to signal the go routine to stop that is handling the cache
-func (m *AzureManager) Cleanup() {
-	close(m.interrupt)
+// listAgentPools gets a list of agent pools and instanceIDs.
+// Note: filter won't take effect for agent pools.
+func (m *AzureManager) listAgentPools(filter []cloudprovider.LabelAutoDiscoveryConfig) (asgs []Asg, err error) {
+	deploy, err := m.deploymentsClient.Get(m.config.ResourceGroup, m.config.Deployment)
+	if err != nil {
+		glog.Errorf("deploymentsClient.Get(%s, %s) failed: %v", m.config.ResourceGroup, m.config.Deployment, err)
+		return nil, err
+	}
+
+	for k := range *deploy.Properties.Parameters {
+		if k == "masterVMSize" || !strings.HasSuffix(k, "VMSize") {
+			continue
+		}
+
+		poolName := strings.TrimRight(k, "VMSize")
+		spec := &dynamic.NodeGroupSpec{
+			Name:               poolName,
+			MinSize:            1,
+			MaxSize:            -1,
+			SupportScaleToZero: scaleToZeroSupported,
+		}
+		asg, _ := NewAgentPool(spec, m)
+		asgs = append(asgs, asg)
+	}
+
+	return asgs, nil
 }

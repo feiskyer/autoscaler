@@ -30,6 +30,7 @@ import (
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/golang/glog"
 	"golang.org/x/crypto/pkcs12"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/client-go/pkg/version"
 )
 
@@ -346,4 +347,23 @@ func GetVMNameIndex(osType compute.OperatingSystemTypes, vmName string) (int, er
 	}
 
 	return agentIndex, nil
+}
+
+func matchDiscoveryConfig(labels map[string]*string, configs []cloudprovider.LabelAutoDiscoveryConfig) bool {
+	for _, c := range configs {
+		for k, v := range c.Selector {
+			value, ok := labels[k]
+			if !ok {
+				return false
+			}
+
+			if len(v) > 0 {
+				if value == nil || *value != v {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
 }
