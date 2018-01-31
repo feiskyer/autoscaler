@@ -85,6 +85,8 @@ type azClient struct {
 	interfacesClient                InterfacesClient
 	disksClient                     DisksClient
 	storageAccountsClient           AccountsClient
+	usageClient                     compute.UsageClient
+	virtualMachineSizesClient       compute.VirtualMachineSizesClient
 }
 
 // newServicePrincipalTokenFromCredentials creates a new ServicePrincipalToken using values of the
@@ -188,6 +190,18 @@ func newAzClient(cfg *Config, env *azure.Environment) (*azClient, error) {
 	disksClient.PollingDelay = 5 * time.Second
 	glog.V(5).Infof("Created disks client with authorizer: %v", disksClient)
 
+	usageClient := compute.NewUsageClient(cfg.SubscriptionID)
+	usageClient.BaseURI = env.ResourceManagerEndpoint
+	usageClient.Authorizer = autorest.NewBearerAuthorizer(spt)
+	usageClient.PollingDelay = 5 * time.Second
+	glog.V(5).Infof("Created usage client with authorizer: %v", usageClient)
+
+	virtualMachineSizesClient := compute.NewVirtualMachineSizesClient(cfg.SubscriptionID)
+	virtualMachineSizesClient.BaseURI = env.ResourceManagerEndpoint
+	virtualMachineSizesClient.Authorizer = autorest.NewBearerAuthorizer(spt)
+	virtualMachineSizesClient.PollingDelay = 5 * time.Second
+	glog.V(5).Infof("Created virtualMachine sizes client with authorizer: %v", virtualMachineSizesClient)
+
 	return &azClient{
 		disksClient:                     disksClient,
 		interfacesClient:                interfacesClient,
@@ -196,5 +210,7 @@ func newAzClient(cfg *Config, env *azure.Environment) (*azClient, error) {
 		deploymentsClient:               deploymentsClient,
 		virtualMachinesClient:           virtualMachinesClient,
 		storageAccountsClient:           storageAccountsClient,
+		usageClient:                     usageClient,
+		virtualMachineSizesClient:       virtualMachineSizesClient,
 	}, nil
 }

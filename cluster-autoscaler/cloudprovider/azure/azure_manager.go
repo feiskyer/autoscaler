@@ -58,6 +58,7 @@ type Config struct {
 	TenantID       string `json:"tenantId" yaml:"tenantId"`
 	SubscriptionID string `json:"subscriptionId" yaml:"subscriptionId"`
 	ResourceGroup  string `json:"resourceGroup" yaml:"resourceGroup"`
+	Location       string `json:"location" yaml:"location"`
 	VMType         string `json:"vmType" yaml:"vmType"`
 
 	AADClientID                 string `json:"aadClientId" yaml:"aadClientId"`
