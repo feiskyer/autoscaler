@@ -49,14 +49,16 @@ const (
 	vmSizeFieldName          = "vmSize"
 
 	// ARM resource Types
-	nsgResourceType = "Microsoft.Network/networkSecurityGroups"
-	rtResourceType  = "Microsoft.Network/routeTables"
-	vmResourceType  = "Microsoft.Compute/virtualMachines"
-	vmExtensionType = "Microsoft.Compute/virtualMachines/extensions"
+	nsgResourceType  = "Microsoft.Network/networkSecurityGroups"
+	rtResourceType   = "Microsoft.Network/routeTables"
+	vmResourceType   = "Microsoft.Compute/virtualMachines"
+	vmExtensionType  = "Microsoft.Compute/virtualMachines/extensions"
+	vnetResourceType = "Microsoft.Network/virtualNetworks"
 
 	// resource ids
-	nsgID = "nsgID"
-	rtID  = "routeTableID"
+	nsgID  = "nsgID"
+	rtID   = "routeTableID"
+	vnetID = "vnetID"
 
 	k8sLinuxVMNamingFormat         = "^[0-9a-zA-Z]{3}-(.+)-([0-9a-fA-F]{8})-{0,2}([0-9]+)$"
 	k8sLinuxVMAgentPoolNameIndex   = 1
@@ -105,6 +107,7 @@ func normalizeForK8sVMASScalingUp(templateMap map[string]interface{}) error {
 	}
 	rtIndex := -1
 	nsgIndex := -1
+	vnetIndex := -1
 	resources := templateMap[resourcesFieldName].([]interface{})
 	for index, resource := range resources {
 		resourceMap, ok := resource.(map[string]interface{})
@@ -130,6 +133,14 @@ func normalizeForK8sVMASScalingUp(templateMap map[string]interface{}) error {
 			}
 			rtIndex = index
 		}
+		if ok && resourceType == vnetResourceType {
+			if vnetIndex != -1 {
+				err := fmt.Errorf("Found 2 resources with type %s in the template. There should only be 1", vnetResourceType)
+				glog.Warningf(err.Error())
+				return err
+			}
+			vnetIndex = index
+		}
 
 		dependencies, ok := resourceMap[dependsOnFieldName].([]interface{})
 		if !ok {
@@ -139,7 +150,8 @@ func normalizeForK8sVMASScalingUp(templateMap map[string]interface{}) error {
 		for dIndex := len(dependencies) - 1; dIndex >= 0; dIndex-- {
 			dependency := dependencies[dIndex].(string)
 			if strings.Contains(dependency, nsgResourceType) || strings.Contains(dependency, nsgID) ||
-				strings.Contains(dependency, rtResourceType) || strings.Contains(dependency, rtID) {
+				strings.Contains(dependency, rtResourceType) || strings.Contains(dependency, rtID) ||
+				strings.Contains(dependency, vnetResourceType) || strings.Contains(dependency, vnetID) {
 				dependencies = append(dependencies[:dIndex], dependencies[dIndex+1:]...)
 			}
 		}
@@ -161,6 +173,11 @@ func normalizeForK8sVMASScalingUp(templateMap map[string]interface{}) error {
 		glog.Infof("Found no resources with type %s in the template.", rtResourceType)
 	} else {
 		indexesToRemove = append(indexesToRemove, rtIndex)
+	}
+	if vnetIndex == -1 {
+		glog.Infof("Found no resource with type %s in the template", vnetResourceType)
+	} else {
+		indexesToRemove = append(indexesToRemove, vnetIndex)
 	}
 	indexesToRemove = append(indexesToRemove, nsgIndex)
 	templateMap[resourcesFieldName] = removeIndexesFromArray(resources, indexesToRemove)
