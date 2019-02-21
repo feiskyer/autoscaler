@@ -296,6 +296,24 @@ func (scaleSet *ScaleSet) Belongs(node *apiv1.Node) (bool, error) {
 	return true, nil
 }
 
+// reserveCaseDifferentNode returns true if the node is existing on Azure but with different-cased ID.
+// For such case, the node shouldn't be removed only because of different cases.
+// This may happen for VMSS nodes as their providerID case may be changed from Azure.
+// It should be called with lock protected.
+func (scaleSet *ScaleSet) reserveCaseDifferentNode(providerID string) bool {
+	resourceID := strings.TrimPrefix(providerID, "azure://")
+	for vmssInstanceID, cachedID := range scaleSet.virtualMachines {
+		if strings.EqualFold(resourceID, cachedID) && resourceID != cachedID {
+			klog.V(3).Infof("Reserving node because CA gets the same node with different cases, providerID (%q) ~= resourceID(%q)", providerID, resourceID)
+			// Update the cached resourceID from node's providerID.
+			scaleSet.virtualMachines[vmssInstanceID] = resourceID
+			return true
+		}
+	}
+
+	return false
+}
+
 // DeleteInstances deletes the given instances. All instances must be controlled by the same ASG.
 func (scaleSet *ScaleSet) DeleteInstances(instances []*azureRef) error {
 	if len(instances) == 0 {
@@ -320,6 +338,12 @@ func (scaleSet *ScaleSet) DeleteInstances(instances []*azureRef) error {
 			return fmt.Errorf("cannot delete instance (%s) which don't belong to the same Scale Set (%q)", instance.Name, commonAsg)
 		}
 
+		// Reserve the node if it's in different case compared to CA's cache.
+		if scaleSet.reserveCaseDifferentNode(instance.GetKey()) {
+			continue
+		}
+
+		// Get vmss instanceID from providerID.
 		instanceID, err := getLastSegment(instance.Name)
 		if err != nil {
 			klog.Errorf("getLastSegment failed with error: %v", err)
@@ -329,6 +353,11 @@ func (scaleSet *ScaleSet) DeleteInstances(instances []*azureRef) error {
 		instanceIDs = append(instanceIDs, instanceID)
 	}
 
+	if len(instanceIDs) == 0 {
+		return nil
+	}
+
+	// Delete the remaining virtual machines.
 	requiredIds := &compute.VirtualMachineScaleSetVMInstanceRequiredIDs{
 		InstanceIds: &instanceIDs,
 	}
