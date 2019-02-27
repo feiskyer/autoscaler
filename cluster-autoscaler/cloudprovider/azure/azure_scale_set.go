@@ -490,9 +490,14 @@ func (scaleSet *ScaleSet) Nodes() ([]cloudprovider.Instance, error) {
 
 	instances := make([]cloudprovider.Instance, 0, len(vms))
 	for i := range vms {
-		name := "azure://" + vms[i]
+		name := "azure://" + strings.ToLower(vms[i])
 		instances = append(instances, cloudprovider.Instance{Id: name})
 	}
 
 	return instances, nil
+}
+
+// NodesLowered returns a list of all nodes (Id in lowered cases) that belong to this node group.
+func (scaleSet *ScaleSet) NodesLowered() ([]cloudprovider.Instance, error) {
+	return scaleSet.Nodes()
 }
