@@ -37,6 +37,11 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
 )
 
+var (
+	scaleSetSizeRefreshPeriod  = 15 * time.Second
+	vmssInstancesRefreshPeriod = 5 * time.Minute
+)
+
 // ScaleSet implements NodeGroup interface.
 type ScaleSet struct {
 	azureRef
@@ -45,9 +50,13 @@ type ScaleSet struct {
 	minSize int
 	maxSize int
 
-	mutex       sync.Mutex
-	lastRefresh time.Time
-	curSize     int64
+	mutex           sync.Mutex
+	curSize         int64
+	lastSizeRefresh time.Time
+
+	instanceMutex       sync.Mutex
+	instanceCache       []cloudprovider.Instance
+	lastInstanceRefresh time.Time
 }
 
 // NewScaleSet creates a new NewScaleSet.
@@ -114,7 +123,7 @@ func (scaleSet *ScaleSet) getCurSize() (int64, error) {
 	scaleSet.mutex.Lock()
 	defer scaleSet.mutex.Unlock()
 
-	if scaleSet.lastRefresh.Add(15 * time.Second).After(time.Now()) {
+	if scaleSet.lastSizeRefresh.Add(scaleSetSizeRefreshPeriod).After(time.Now()) {
 		return scaleSet.curSize, nil
 	}
 
@@ -125,8 +134,13 @@ func (scaleSet *ScaleSet) getCurSize() (int64, error) {
 	}
 	klog.V(5).Infof("Getting scale set (%q) capacity: %d\n", scaleSet.Name, *set.Sku.Capacity)
 
+	if scaleSet.curSize != *set.Sku.Capacity {
+		// Invalid the instance cache if the capacity has changed.
+		scaleSet.invalidInstanceCache()
+	}
+
 	scaleSet.curSize = *set.Sku.Capacity
-	scaleSet.lastRefresh = time.Now()
+	scaleSet.lastSizeRefresh = time.Now()
 	return scaleSet.curSize, nil
 }
 
@@ -157,7 +171,8 @@ func (scaleSet *ScaleSet) SetScaleSetSize(size int64) error {
 	if isSuccess {
 		klog.V(3).Infof("virtualMachineScaleSetsClient.CreateOrUpdate(%s) success", scaleSet.Name)
 		scaleSet.curSize = size
-		scaleSet.lastRefresh = time.Now()
+		scaleSet.lastSizeRefresh = time.Now()
+		scaleSet.invalidInstanceCache()
 		return nil
 	}
 
@@ -459,8 +474,13 @@ func (scaleSet *ScaleSet) TemplateNodeInfo() (*schedulernodeinfo.NodeInfo, error
 
 // Nodes returns a list of all nodes that belong to this node group.
 func (scaleSet *ScaleSet) Nodes() ([]cloudprovider.Instance, error) {
-	scaleSet.mutex.Lock()
-	defer scaleSet.mutex.Unlock()
+	scaleSet.instanceMutex.Lock()
+	defer scaleSet.instanceMutex.Unlock()
+
+	if int64(len(scaleSet.instanceCache)) == scaleSet.curSize &&
+		scaleSet.lastInstanceRefresh.Add(vmssInstancesRefreshPeriod).After(time.Now()) {
+		return scaleSet.instanceCache, nil
+	}
 
 	vms, err := scaleSet.GetScaleSetVms()
 	if err != nil {
@@ -473,5 +493,13 @@ func (scaleSet *ScaleSet) Nodes() ([]cloudprovider.Instance, error) {
 		instances = append(instances, cloudprovider.Instance{Id: name})
 	}
 
+	scaleSet.instanceCache = instances
+	scaleSet.lastInstanceRefresh = time.Now()
 	return instances, nil
+}
+
+func (scaleSet *ScaleSet) invalidInstanceCache() {
+	scaleSet.instanceMutex.Lock()
+	scaleSet.instanceCache = make([]cloudprovider.Instance, 0)
+	scaleSet.instanceMutex.Unlock()
 }
