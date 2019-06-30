@@ -600,7 +600,9 @@ func getUpcomingNodeInfos(registry *clusterstate.ClusterStateRegistry, nodeInfos
 			continue
 		}
 		for i := 0; i < numberOfNodes; i++ {
-			upcomingNodes = append(upcomingNodes, nodeTemplate.Node())
+			node := nodeTemplate.Node().DeepCopy()
+			node.Name = fmt.Sprintf("%s-%d", node.Name, i)
+			upcomingNodes = append(upcomingNodes, node)
 		}
 	}
 	return upcomingNodes
