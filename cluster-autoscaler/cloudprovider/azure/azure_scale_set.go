@@ -19,6 +19,7 @@ package azure
 import (
 	"fmt"
 	"math/rand"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -35,12 +36,26 @@ import (
 	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
+	"github.com/Azure/go-autorest/autorest"
 )
 
 var (
 	scaleSetSizeRefreshPeriod  = 15 * time.Second
 	vmssInstancesRefreshPeriod = 5 * time.Minute
 )
+
+func init() {
+	// in go-autorest SDK vendor\github.com\Azure\go-autorest\autorest\sender.go Ln 242
+	// if ARM returns http.StatusTooManyRequests, the sender doesn't increase the retry attempt count,
+	// so the arm_client will keep retrying forever until it get a status code other than 429.
+	statusCodesForRetry := make([]int, 0)
+	for _, code := range autorest.StatusCodesForRetry {
+		if code != http.StatusTooManyRequests {
+			statusCodesForRetry = append(statusCodesForRetry, code)
+		}
+	}
+	autorest.StatusCodesForRetry = statusCodesForRetry
+}
 
 // ScaleSet implements NodeGroup interface.
 type ScaleSet struct {
@@ -130,6 +145,12 @@ func (scaleSet *ScaleSet) getCurSize() (int64, error) {
 	klog.V(5).Infof("Get scale set size for %q", scaleSet.Name)
 	set, err := scaleSet.getVMSSInfo()
 	if err != nil {
+		if isAzureRequestsThrottled(err) {
+			// Log a warning and update the instance refresh time so that it would retry after next vmssInstancesRefreshPeriod.
+			klog.Warningf("getVMSSInfo() is throttled with message %v, would return the cached vmss size", err)
+			scaleSet.lastSizeRefresh = time.Now()
+			return scaleSet.curSize, nil
+		}
 		return -1, err
 	}
 	klog.V(5).Infof("Getting scale set (%q) capacity: %d\n", scaleSet.Name, *set.Sku.Capacity)
@@ -484,6 +505,12 @@ func (scaleSet *ScaleSet) Nodes() ([]cloudprovider.Instance, error) {
 
 	vms, err := scaleSet.GetScaleSetVms()
 	if err != nil {
+		if isAzureRequestsThrottled(err) {
+			// Log a warning and update the instance refresh time so that it would retry after next vmssInstancesRefreshPeriod.
+			klog.Warningf("GetScaleSetVms() is throttled with message %v, would return the cached instances", err)
+			scaleSet.lastInstanceRefresh = time.Now()
+			return scaleSet.instanceCache, nil
+		}
 		return nil, err
 	}
 
@@ -500,6 +527,6 @@ func (scaleSet *ScaleSet) Nodes() ([]cloudprovider.Instance, error) {
 
 func (scaleSet *ScaleSet) invalidInstanceCache() {
 	scaleSet.instanceMutex.Lock()
-	scaleSet.instanceCache = make([]cloudprovider.Instance, 0)
+	scaleSet.lastInstanceRefresh = time.Now().Add(-1 * vmssInstancesRefreshPeriod)
 	scaleSet.instanceMutex.Unlock()
 }
