@@ -19,6 +19,7 @@ package azure
 import (
 	"fmt"
 	"math/rand"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -135,34 +136,55 @@ func (scaleSet *ScaleSet) GetScaleSetSize() (int64, error) {
 	return scaleSet.getCurSize()
 }
 
-// SetScaleSetSize sets ScaleSet size.
-func (scaleSet *ScaleSet) SetScaleSetSize(size int64) error {
-	scaleSet.mutex.Lock()
-	defer scaleSet.mutex.Unlock()
+func (scaleSet *ScaleSet) updateVMSSCapacity(size int64) {
+	var op compute.VirtualMachineScaleSet
+	var resp *http.Response
+	var isSuccess bool
+	var err error
+
+	defer func() {
+		if err != nil {
+			klog.Errorf("Failed to update the capacity for vmss %s with error %v, invalidate the cache so as to get the real size from API", scaleSet.Name(), err)
+			// Invalidate the vmss size cache, so that it would be got by API.
+			scaleSet.mutex.Lock()
+			defer scaleSet.mutex.Unlock()
+			scaleSet.lastRefresh = time.Now().Add(-1 * 15 * time.Second)
+		}
+	}()
 
 	resourceGroup := scaleSet.manager.config.ResourceGroup
-	op, err := scaleSet.getVMSSInfo()
+	op, err = scaleSet.getVMSSInfo()
 	if err != nil {
-		return err
+		return
 	}
 
 	op.Sku.Capacity = &size
 	op.Identity = nil
 	op.VirtualMachineScaleSetProperties.ProvisioningState = nil
-	updateCtx, updateCancel := getContextWithCancel()
-	defer updateCancel()
+	ctx, cancel := getContextWithCancel()
+	defer cancel()
 	klog.V(3).Infof("Waiting for virtualMachineScaleSetsClient.CreateOrUpdate(%s)", scaleSet.Name)
-	resp, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.CreateOrUpdate(updateCtx, resourceGroup, scaleSet.Name, op)
-	isSuccess, realError := isSuccessHTTPResponse(resp, err)
+	resp, err = scaleSet.manager.azClient.virtualMachineScaleSetsClient.CreateOrUpdate(ctx, resourceGroup, scaleSet.Name, op)
+	isSuccess, err = isSuccessHTTPResponse(resp, err)
 	if isSuccess {
 		klog.V(3).Infof("virtualMachineScaleSetsClient.CreateOrUpdate(%s) success", scaleSet.Name)
-		scaleSet.curSize = size
-		scaleSet.lastRefresh = time.Now()
-		return nil
+		return
 	}
 
-	klog.Errorf("virtualMachineScaleSetsClient.CreateOrUpdate for scale set %q failed: %v", scaleSet.Name, realError)
-	return realError
+	klog.Errorf("virtualMachineScaleSetsClient.CreateOrUpdate for scale set %q failed: %v", scaleSet.Name, err)
+	return
+}
+
+// SetScaleSetSize sets ScaleSet size.
+func (scaleSet *ScaleSet) SetScaleSetSize(size int64) error {
+	scaleSet.mutex.Lock()
+	defer scaleSet.mutex.Unlock()
+
+	// Proactively set the ASG size so autoscaler makes better decisions.
+	scaleSet.curSize = size
+	scaleSet.lastRefresh = time.Now()
+	go scaleSet.updateVMSSCapacity(size)
+	return nil
 }
 
 // TargetSize returns the current TARGET size of the node group. It is possible that the
