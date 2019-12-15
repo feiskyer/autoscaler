@@ -29,7 +29,10 @@ import (
 	"k8s.io/klog"
 )
 
-var virtualMachineRE = regexp.MustCompile(`^azure://(?:.*)/providers/Microsoft.Compute/virtualMachines/(.+)$`)
+var (
+	defaultAsgCacheTTL = 900 // Seconds
+	virtualMachineRE   = regexp.MustCompile(`^azure://(?:.*)/providers/Microsoft.Compute/virtualMachines/(.+)$`)
+)
 
 type asgCache struct {
 	registeredAsgs     []cloudprovider.NodeGroup
@@ -39,7 +42,7 @@ type asgCache struct {
 	interrupt          chan struct{}
 }
 
-func newAsgCache() (*asgCache, error) {
+func newAsgCache(asgCacheTTL int64) (*asgCache, error) {
 	cache := &asgCache{
 		registeredAsgs:     make([]cloudprovider.NodeGroup, 0),
 		instanceToAsg:      make(map[azureRef]cloudprovider.NodeGroup),
@@ -53,7 +56,7 @@ func newAsgCache() (*asgCache, error) {
 		if err := cache.regenerate(); err != nil {
 			klog.Errorf("Error while regenerating Asg cache: %v", err)
 		}
-	}, time.Hour, cache.interrupt)
+	}, time.Duration(asgCacheTTL)*time.Second, cache.interrupt)
 
 	return cache, nil
 }
@@ -126,6 +129,7 @@ func (m *asgCache) FindForInstance(instance *azureRef, vmType string) (cloudprov
 	if m.notInRegisteredAsg[inst] {
 		// We already know we don't own this instance. Return early and avoid
 		// additional calls.
+		klog.Warningf("Couldn't to find NodeGroup for unknown instance %q", inst)
 		return nil, nil
 	}
 
@@ -160,8 +164,7 @@ func (m *asgCache) FindForInstance(instance *azureRef, vmType string) (cloudprov
 		return asg, nil
 	}
 
-	// Add the instance to notInRegisteredAsg since it's unknown from Azure.
-	m.notInRegisteredAsg[inst] = true
+	klog.Warningf("Couldn't to find NodeGroup for unknown instance %q", inst)
 	return nil, nil
 }
 
@@ -186,6 +189,8 @@ func (m *asgCache) regenerate() error {
 	}
 
 	m.instanceToAsg = newCache
+	// Invalidating unowned instance cache.
+	m.invalidateUnownedInstanceCache()
 	return nil
 }
 
